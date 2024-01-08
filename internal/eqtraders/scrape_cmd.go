@@ -7,11 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/Akkadius/spire/internal/models"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gammazero/workerpool"
 	"github.com/gosimple/slug"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"golang.org/x/net/html"
 	"gorm.io/gorm"
 	"io"
 	"net/http"
@@ -519,8 +521,6 @@ func (c *ScrapeCommand) parseRecipePage(r ExpansionRecipe) {
 		contents = string(data)
 	}
 
-	contents = strings.ReplaceAll(contents, "<td>&nbsp;&nbsp;</td>", "")
-
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader([]byte(contents)))
 	if err != nil {
 		c.logger.Error(err)
@@ -535,6 +535,13 @@ func (c *ScrapeCommand) parseRecipePage(r ExpansionRecipe) {
 
 		wp.Submit(func() {
 
+			// this is a td that contains <td>&nbsp;&nbsp;</td> and messed up the parsing
+			messedUpRow := false
+			messedUpRowStr, _ := s.Find("td").First().Html()
+			if len(messedUpRowStr) == 4 {
+				messedUpRow = true
+			}
+
 			recipeName := strings.TrimSpace(s.Find("td a").First().Text())
 			recipeNameHtml, err := s.Find("td").First().Html()
 			if err != nil {
@@ -545,6 +552,19 @@ func (c *ScrapeCommand) parseRecipePage(r ExpansionRecipe) {
 				c.logger.Error(err)
 			}
 			recipeText := s.Find("td").Next().Text()
+
+			// some pages are formatted strange and have an extra <td> beginning of the row
+			if messedUpRow {
+				recipeName = s.Find("td").First().Next().Text()
+				recipeNameHtml = strings.TrimSpace(s.Find("td").First().Next().Text())
+				recipe, err = s.Find("td").First().Next().Next().Html()
+				if err != nil {
+					c.logger.Error(err)
+				}
+				recipeText = s.Find("td").First().Next().Next().Text()
+
+				//fmt.Printf("messed up recipeName [%v] recipeNameHtml [%v] recipeText [%v] recipe [%v]\n", recipeName, recipeNameHtml, recipeText, recipe)
+			}
 
 			consumeContainer := false
 
@@ -564,7 +584,9 @@ func (c *ScrapeCommand) parseRecipePage(r ExpansionRecipe) {
 			// trivial
 			trivialInt := 0
 			trivial := s.Find("td").Next().Next().Text()
-			//pp.Println(trivial)
+			if messedUpRow {
+				trivial = s.Find("td").First().Next().Next().Next().Text()
+			}
 
 			trivialInt, _ = strconv.Atoi(trivial)
 
@@ -621,9 +643,12 @@ func (c *ScrapeCommand) parseRecipePage(r ExpansionRecipe) {
 					}
 				}
 
+				name := c.getStringInBetween(s, ">", "<")
+				name = html.UnescapeString(name)
+
 				componentsList = append(componentsList, Item{
 					ItemId:   c.getItemIdFromHtml(s),
-					ItemName: c.getStringInBetween(s, ">", "<"),
+					ItemName: name,
 					Count:    quantity,
 				})
 			}
@@ -641,6 +666,8 @@ func (c *ScrapeCommand) parseRecipePage(r ExpansionRecipe) {
 					name = strings.ReplaceAll(name, " (Stationary)", "")
 					name = strings.ReplaceAll(name, " (Formerly Ak&#39;Anon Forge)", "")
 					name = strings.TrimSpace(name)
+					// html decode name
+					name = html.UnescapeString(name)
 
 					objectType := c.getObjectTypeFromName(name)
 					if objectType.Type > 0 {
@@ -697,9 +724,12 @@ func (c *ScrapeCommand) parseRecipePage(r ExpansionRecipe) {
 					}
 				}
 
+				name := c.getStringInBetween(s, ">", "<")
+				name = html.UnescapeString(name)
+
 				returnItems = append(returnItems, Item{
 					ItemId:   i,
-					ItemName: c.getStringInBetween(s, ">", "<"),
+					ItemName: name,
 					Count:    quantity,
 				})
 			}
@@ -871,6 +901,18 @@ func (c *ScrapeCommand) parseRecipePage(r ExpansionRecipe) {
 				}
 			}
 
+			recipeItemId := 0
+			if messedUpRow {
+				var item models.Item
+				c.db.Where("Name = ?", strings.TrimSpace(recipeName)).First(&item)
+
+				if item.ID > 0 {
+					recipeItemId = item.ID
+				}
+			} else {
+				recipeItemId = c.getItemIdFromHtml(recipeNameHtml)
+			}
+
 			r := Recipe{
 				RecipeName:         recipeName,
 				Skill:              skill,
@@ -880,7 +922,7 @@ func (c *ScrapeCommand) parseRecipePage(r ExpansionRecipe) {
 				RequiredSkillLevel: requiredSkillLevel,
 				ConsumeContainer:   consumeContainer,
 				NoFail:             noFail,
-				RecipeItemId:       c.getItemIdFromHtml(recipeNameHtml),
+				RecipeItemId:       recipeItemId,
 				Components:         componentsList,
 				In:                 inList,
 				Yield:              yieldInt,
